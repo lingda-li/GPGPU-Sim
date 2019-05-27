@@ -127,12 +127,24 @@ void *gpgpu_sim_thread_concurrent(void*)
             if(g_stream_manager->operation(&sim_cycles) && !g_the_gpu->active())
                 break;
 
+            // lld
+            if(g_the_gpu->arrive_limit())
+            {
+                g_the_gpu->print_stats();
+                g_the_gpu->update_stats();
+                print_simulation_time();
+                printf("GPGPU-Sim: ** STOP simulation because of limitation **\n");
+                exit(0);
+            }
+
             if( g_the_gpu->active() ) {
                 g_the_gpu->cycle();
                 sim_cycles = true;
                 g_the_gpu->deadlock_check();
             }
             active=g_the_gpu->active() || !g_stream_manager->empty_protected();
+            //active=g_the_gpu->active();
+            //printf("I am here. %d, %d**\n", g_the_gpu->active(), g_stream_manager->empty_protected());
         } while( active );
         if(g_debug_execution >= 3) {
            printf("GPGPU-Sim: ** STOP simulation thread (no work) **\n");

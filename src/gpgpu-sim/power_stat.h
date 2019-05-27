@@ -436,7 +436,8 @@ public:
     }
 
     unsigned get_l1d_read_accesses(){
-        enum mem_access_type access_type[] = {GLOBAL_ACC_R, LOCAL_ACC_R};
+        //enum mem_access_type access_type[] = {GLOBAL_ACC_R, LOCAL_ACC_R};
+        enum mem_access_type access_type[] = {GLOBAL_ACC_R, LOCAL_ACC_R, L1_PREF_ACC_R}; // lld
         enum cache_request_status request_status[] = {HIT, MISS, HIT_RESERVED};
         unsigned num_access_type = sizeof(access_type)/sizeof(enum mem_access_type);
         unsigned num_request_status = sizeof(request_status)/sizeof(enum cache_request_status);
@@ -445,7 +446,8 @@ public:
                 (pwr_mem_stat->core_cache_stats[PREV_STAT_IDX].get_stats(access_type, num_access_type, request_status, num_request_status));
     }
     unsigned get_l1d_read_misses(){
-        enum mem_access_type access_type[] = {GLOBAL_ACC_R, LOCAL_ACC_R};
+        //enum mem_access_type access_type[] = {GLOBAL_ACC_R, LOCAL_ACC_R};
+        enum mem_access_type access_type[] = {GLOBAL_ACC_R, LOCAL_ACC_R, L1_PREF_ACC_R}; // lld
         enum cache_request_status request_status[] = {MISS};
         unsigned num_access_type = sizeof(access_type)/sizeof(enum mem_access_type);
         unsigned num_request_status = sizeof(request_status)/sizeof(enum cache_request_status);
@@ -498,7 +500,8 @@ public:
     }
 
     unsigned get_l2_read_accesses(){
-        enum mem_access_type access_type[] = {GLOBAL_ACC_R, LOCAL_ACC_R, CONST_ACC_R, TEXTURE_ACC_R, INST_ACC_R};
+        //enum mem_access_type access_type[] = {GLOBAL_ACC_R, LOCAL_ACC_R, CONST_ACC_R, TEXTURE_ACC_R, INST_ACC_R};
+        enum mem_access_type access_type[] = {GLOBAL_ACC_R, LOCAL_ACC_R, CONST_ACC_R, TEXTURE_ACC_R, INST_ACC_R, L1_PREF_ACC_R, L2_PREF_ACC_R}; // lld
         enum cache_request_status request_status[] = {HIT, MISS, HIT_RESERVED};
         unsigned num_access_type = sizeof(access_type)/sizeof(enum mem_access_type);
         unsigned num_request_status = sizeof(request_status)/sizeof(enum cache_request_status);
@@ -508,7 +511,8 @@ public:
     }
 
     unsigned get_l2_read_misses(){
-        enum mem_access_type access_type[] = {GLOBAL_ACC_R, LOCAL_ACC_R, CONST_ACC_R, TEXTURE_ACC_R, INST_ACC_R};
+        //enum mem_access_type access_type[] = {GLOBAL_ACC_R, LOCAL_ACC_R, CONST_ACC_R, TEXTURE_ACC_R, INST_ACC_R};
+        enum mem_access_type access_type[] = {GLOBAL_ACC_R, LOCAL_ACC_R, CONST_ACC_R, TEXTURE_ACC_R, INST_ACC_R, L1_PREF_ACC_R, L2_PREF_ACC_R}; // lld
         enum cache_request_status request_status[] = {MISS};
         unsigned num_access_type = sizeof(access_type)/sizeof(enum mem_access_type);
         unsigned num_request_status = sizeof(request_status)/sizeof(enum cache_request_status);

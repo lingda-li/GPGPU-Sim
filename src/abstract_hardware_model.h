@@ -287,6 +287,7 @@ struct core_config {
     // texture and constant cache line sizes (used to determine number of memory accesses)
     unsigned gpgpu_cache_texl1_linesize;
     unsigned gpgpu_cache_constl1_linesize;
+    unsigned gpgpu_cache_datal1_linesize; // lld
 
 	unsigned gpgpu_max_insn_issue_per_warp;
 };
@@ -561,7 +562,11 @@ private:
    unsigned m_bank; // n in ".const[n]"; note .const == .const[0] (see PTX 2.1 manual, sec. 5.1.3)
 };
 
-const unsigned MAX_MEMORY_ACCESS_SIZE = 128;
+//const unsigned MAX_MEMORY_ACCESS_SIZE = 128;
+const unsigned MAX_MEMORY_ACCESS_SIZE = 256; // lld
+const unsigned CACHE_CHUNK_SIZE = 32; // lld
+//const unsigned CACHE_CHUNK_SIZE = 8; // lld
+const unsigned MAX_CACHE_CHUNK_NUM = (MAX_MEMORY_ACCESS_SIZE / CACHE_CHUNK_SIZE); // lld
 typedef std::bitset<MAX_MEMORY_ACCESS_SIZE> mem_access_byte_mask_t;
 #define NO_PARTIAL_WRITE (mem_access_byte_mask_t())
 
@@ -578,6 +583,8 @@ MA_TUP_BEGIN( mem_access_type ) \
    MA_TUP( INST_ACC_R ), \
    MA_TUP( L1_WR_ALLOC_R ), \
    MA_TUP( L2_WR_ALLOC_R ), \
+   MA_TUP( L1_PREF_ACC_R ), \
+   MA_TUP( L2_PREF_ACC_R ), \
    MA_TUP( NUM_MEM_ACCESS_TYPE ) \
 MA_TUP_END( mem_access_type ) 
 
@@ -621,6 +628,9 @@ public:
        m_addr = address;
        m_req_size = size;
        m_write = wr;
+       // lld: set sector mask
+       for(unsigned i = 0; i < size; i++)
+           m_byte_mask.set(i);
    }
    mem_access_t( mem_access_type type, 
                  new_addr_type address, 
@@ -644,6 +654,8 @@ public:
    bool is_write() const { return m_write; }
    enum mem_access_type get_type() const { return m_type; }
    mem_access_byte_mask_t get_byte_mask() const { return m_byte_mask; }
+   void set_byte_mask(unsigned i, bool value) { if(value) m_byte_mask.set(i);
+                                                else m_byte_mask.reset(i); } // lld: sector cache
 
    void print(FILE *fp) const
    {
@@ -658,6 +670,8 @@ public:
        case L2_WRBK_ACC:   fprintf(fp,"L2_WRBK "); break;
        case INST_ACC_R:    fprintf(fp,"INST    "); break;
        case L1_WRBK_ACC:   fprintf(fp,"L1_WRBK "); break;
+       case L1_PREF_ACC_R: fprintf(fp,"L1_PREF "); break; // lld
+       case L2_PREF_ACC_R: fprintf(fp,"L2_PREF "); break; // lld
        default:            fprintf(fp,"unknown "); break;
        }
    }
@@ -834,7 +848,7 @@ public:
     { 
         m_empty=true; 
     }
-    void issue( const active_mask_t &mask, unsigned warp_id, unsigned long long cycle, int dynamic_warp_id ) 
+    void issue( const active_mask_t &mask, unsigned warp_id, unsigned long long cycle, int dynamic_warp_id, unsigned cta_id ) // lld: for more information
     {
         m_warp_active_mask = mask;
         m_warp_issued_mask = mask; 
@@ -845,6 +859,7 @@ public:
         cycles = initiation_interval;
         m_cache_hit=false;
         m_empty=false;
+        m_cta_id = cta_id; // lld: cta id
     }
     const active_mask_t & get_active_mask() const
     {
@@ -872,7 +887,8 @@ public:
     }
 
     struct transaction_info {
-        std::bitset<4> chunks; // bitmask: 32-byte chunks accessed
+        //std::bitset<4> chunks; // bitmask: 32-byte chunks accessed
+        std::bitset<8> chunks; // lld: bitmask: 32-byte chunks accessed
         mem_access_byte_mask_t bytes;
         active_mask_t active; // threads in this transaction
 
@@ -930,6 +946,11 @@ public:
         assert( !m_empty );
         return m_dynamic_warp_id; 
     }
+    unsigned cta_id() const // lld: cta id
+    { 
+        assert( !m_empty );
+        return m_cta_id; 
+    }
     bool has_callback( unsigned n ) const
     {
         return m_warp_active_mask[n] && m_per_scalar_thread_valid && 
@@ -949,6 +970,13 @@ public:
     unsigned accessq_count() const { return m_accessq.size(); }
     const mem_access_t &accessq_back() { return m_accessq.back(); }
     void accessq_pop_back() { m_accessq.pop_back(); }
+    bool accessq_find(new_addr_type addr) const { // lld: find address
+        for(std::list<mem_access_t>::const_iterator it = m_accessq.begin(); it != m_accessq.end(); it++) {
+            if((*it).get_addr() == addr)
+                return true;
+        }
+        return false;
+    }
 
     bool dispatch_delay()
     { 
@@ -979,6 +1007,7 @@ protected:
     const core_config *m_config; 
     active_mask_t m_warp_active_mask; // dynamic active mask for timing model (after predication)
     active_mask_t m_warp_issued_mask; // active mask at issue (prior to predication test) -- for instruction counting
+    unsigned m_cta_id; // lld: cta id
 
     struct per_thread_info {
         per_thread_info() {

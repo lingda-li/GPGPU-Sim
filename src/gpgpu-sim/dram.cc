@@ -530,6 +530,10 @@ void dram_t::visualizer_print( gzFile visualizer_file )
                m_stats->mem_access_type_stats[CONST_ACC_R][id][j]);
       gzprintf(visualizer_file,"dramtexture_acc_r: %u %u %u\n", id, j, 
                m_stats->mem_access_type_stats[TEXTURE_ACC_R][id][j]);
+      gzprintf(visualizer_file,"draml1pref_acc_r: %u %u %u\n", id, j, 
+               m_stats->mem_access_type_stats[L1_PREF_ACC_R][id][j]);
+      gzprintf(visualizer_file,"draml2pref_acc_r: %u %u %u\n", id, j, 
+               m_stats->mem_access_type_stats[L2_PREF_ACC_R][id][j]);
    }
 }
 

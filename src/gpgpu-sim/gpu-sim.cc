@@ -152,6 +152,11 @@ void memory_config::reg_options(class OptionParser * opp)
                    "unified banked L2 data cache config "
                    " {<nsets>:<bsize>:<assoc>,<rep>:<wr>:<alloc>:<wr_alloc>,<mshr>:<N>:<merge>,<mq>}",
                    "64:128:8,L:B:m:N,A:16:4,4");
+    // lld: L2 cache replacement configuration
+    option_parser_register(opp, "-gpgpu_cache:dl2:repl", OPT_CSTR, &m_L2_config.m_config_repl_string, 
+                   "unified banked L2 data cache replacement config "
+                   " {<base_repl>:<rrpv_nbit>:<nthreads>,<nsets>:<assoc>:<pr>,<addr_len>:<nbits>:<index>,<tag_len>... | none}",
+                   "none");
     option_parser_register(opp, "-gpgpu_cache:dl2_texture_only", OPT_BOOL, &m_L2_texure_only, 
                            "L2 cache used for texture only",
                            "1");
@@ -225,6 +230,11 @@ void shader_core_config::reg_options(class OptionParser * opp)
     option_parser_register(opp, "-gpgpu_cache:dl1PreShared", OPT_CSTR, &m_L1D_config.m_config_stringPrefShared,
                    "per-shader L1 data cache config "
                    " {<nsets>:<bsize>:<assoc>,<rep>:<wr>:<alloc>:<wr_alloc>,<mshr>:<N>:<merge>,<mq> | none}",
+                   "none" );
+    // lld: L1D cache replacement configuration
+    option_parser_register(opp, "-gpgpu_cache:dl1:repl", OPT_CSTR, &m_L1D_config.m_config_repl_string,
+                   "per-shader L1 data cache replacement config "
+                   " {<base_repl>:<rrpv_nbit>:<nthreads>,<nsets>:<assoc>:<pr>,<addr_len>:<nbits>:<index>,<tag_len>... | none}",
                    "none" );
     option_parser_register(opp, "-gmem_skip_L1D", OPT_BOOL, &gmem_skip_L1D, 
                    "global memory access skip L1D cache (implements -Xptxas -dlcm=cg, default=no skip)",
@@ -678,6 +688,18 @@ bool gpgpu_sim::active()
     return false;
 }
 
+// lld
+bool gpgpu_sim::arrive_limit()
+{
+    if (m_config.gpu_max_cycle_opt && (gpu_tot_sim_cycle + gpu_sim_cycle) >= m_config.gpu_max_cycle_opt) 
+       return true;
+    if (m_config.gpu_max_insn_opt && (gpu_tot_sim_insn + gpu_sim_insn) >= m_config.gpu_max_insn_opt) 
+       return true;
+    if (m_config.gpu_max_cta_opt && (gpu_tot_issued_cta >= m_config.gpu_max_cta_opt) )
+       return true;
+    return false;
+}
+
 void gpgpu_sim::init()
 {
     // run a CUDA grid on the GPU microarchitecture simulator
@@ -751,8 +773,10 @@ void gpgpu_sim::deadlock_check()
                  printf("GPGPU-Sim uArch: DEADLOCK  shader cores no longer committing instructions [core(# threads)]:\n" );
                  printf("GPGPU-Sim uArch: DEADLOCK  ");
                  m_cluster[i]->print_not_completed(stdout);
+                 //m_cluster[i]->display_pipeline(i,stdout,1,0x2E); // lld
              } else if (num_cores < 8 ) {
                  m_cluster[i]->print_not_completed(stdout);
+                 //m_cluster[i]->display_pipeline(i,stdout,1,0x2E); // lld
              } else if (num_cores >= 8 ) {
                  printf(" + others ... ");
              }
@@ -957,6 +981,34 @@ void gpgpu_sim::gpu_print_stat()
               printf("L2_total_cache_miss_rate = %.4lf\n", (double)total_l2_css.misses/(double)total_l2_css.accesses);
           printf("L2_total_cache_pending_hits = %u\n", total_l2_css.pending_hits);
           printf("L2_total_cache_reservation_fails = %u\n", total_l2_css.res_fails);
+          // lld
+          if(total_l2_css.miss_repl)
+              printf("L2_total_cache_miss_replacement = %u\n", total_l2_css.miss_repl);
+          if(total_l2_css.partial_misses)
+              printf("L2_total_cache_partial_misses = %u\n", total_l2_css.partial_misses);
+          if(total_l2_css.partial_miss_repl)
+              printf("L2_total_cache_partial_miss_replacement = %u\n", total_l2_css.partial_miss_repl);
+          printf("L2_total_cache_fills = %u\n", total_l2_css.fills);
+          if(total_l2_css.fills)
+              printf("L2_total_cache_fill_average_latency = %.2f\n", (double)total_l2_css.total_lat/(double)total_l2_css.fills);
+          printf("L2_total_mshr_size_full = %u\n", total_l2_css.mshr_size_full);
+          printf("L2_total_mshr_list_full = %u\n", total_l2_css.mshr_list_full);
+          if(total_l2_css.prefetches || total_l2_css.useful_prefetches || total_l2_css.useless_prefetches || total_l2_css.desired_prefetches) {
+              printf("L2_total_prefetches = %u\n", total_l2_css.prefetches);
+              printf("L2_total_useful_prefetches = %u\n", total_l2_css.useful_prefetches);
+              printf("L2_total_useless_prefetches = %u\n", total_l2_css.useless_prefetches);
+              printf("L2_total_desired_prefetches = %u\n", total_l2_css.desired_prefetches);
+          }
+          for(unsigned i = 0; i <= m_memory_config->m_L2_config.get_line_sz(); i++)
+              if(total_l2_css.reuse[i])
+                  printf("\tL2_total_intra_line_reuse[%u] = %u\n", i, total_l2_css.reuse[i]);
+          for(unsigned i = 0; i <= m_memory_config->m_L2_config.get_line_sz() / CACHE_CHUNK_SIZE; i++)
+              printf("\tL2_total_intra_line_chunk_reuse[%u] = %u\n", i, total_l2_css.chunk_reuse[i]);
+          for(unsigned i = 0; i <= m_memory_config->m_L2_config.get_line_sz() / CACHE_CHUNK_SIZE; i++)
+              printf("\tL2_total_intra_line_continuous_chunk_reuse[%u] = %u\n", i, total_l2_css.chunk_cont_reuse[i]);
+          for(unsigned i = 0; i < NUM_CACHE_REPL_STATS; i++)
+              if(total_l2_css.repl_stats[i])
+                  printf("L2_total_stats[%s] = %u\n", cache_repl_stats_str((enum cache_repl_stats)i), total_l2_css.repl_stats[i]);
           printf("L2_total_cache_breakdown:\n");
           l2_stats.print_stats(stdout, "L2_cache_stats_breakdown");
           total_l2_css.print_port_stats(stdout, "L2_cache");
@@ -1100,7 +1152,8 @@ void shader_core_ctx::issue_block2core( kernel_info_t &kernel )
     m_n_active_cta++;
 
     shader_CTA_count_log(m_sid, 1);
-    printf("GPGPU-Sim uArch: core:%3d, cta:%2u initialized @(%lld,%lld)\n", m_sid, free_cta_hw_id, gpu_sim_cycle, gpu_tot_sim_cycle );
+    // lld
+    //printf("GPGPU-Sim uArch: core:%3d, cta:%2u initialized @(%lld,%lld)\n", m_sid, free_cta_hw_id, gpu_sim_cycle, gpu_tot_sim_cycle );
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////
@@ -1219,8 +1272,9 @@ void gpgpu_sim::cycle()
       // L1 cache + shader core pipeline stages
       m_power_stats->pwr_mem_stat->core_cache_stats[CURRENT_STAT_IDX].clear();
       for (unsigned i=0;i<m_shader_config->n_simt_clusters;i++) {
+         m_cluster[i]->core_cycle(); // lld: prevent prefetch requests from blocking network, another way is to just throw out all pending requests (also must deal with MSHR entry and reserved cache line)
          if (m_cluster[i]->get_not_completed() || get_more_cta_left() ) {
-               m_cluster[i]->core_cycle();
+               //m_cluster[i]->core_cycle();
                *active_sms+=m_cluster[i]->get_n_active_sms();
          }
          // Update core icnt/cache stats for GPUWattch

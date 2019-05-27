@@ -684,7 +684,7 @@ void shader_core_ctx::issue_warp( register_set& pipe_reg_set, const warp_inst_t*
     m_warp[warp_id].ibuffer_free();
     assert(next_inst->valid());
     **pipe_reg = *next_inst; // static instruction information
-    (*pipe_reg)->issue( active_mask, warp_id, gpu_tot_sim_cycle + gpu_sim_cycle, m_warp[warp_id].get_dynamic_warp_id() ); // dynamic instruction information
+    (*pipe_reg)->issue( active_mask, warp_id, gpu_tot_sim_cycle + gpu_sim_cycle, m_warp[warp_id].get_dynamic_warp_id(), m_warp[warp_id].get_cta_id() ); // dynamic instruction information // lld: for more information
     m_stats->shader_cycle_distro[2+(*pipe_reg)->active_count()]++;
     func_exec_inst( **pipe_reg );
     if( next_inst->op == BARRIER_OP ){
@@ -1191,7 +1191,10 @@ void ldst_unit::get_cache_stats(cache_stats &cs) {
 
 void ldst_unit::get_L1D_sub_stats(struct cache_sub_stats &css) const{
     if(m_L1D)
+    {
+        m_L1D->print_stats(); // lld: print replacement stats
         m_L1D->get_sub_stats(css);
+    }
 }
 void ldst_unit::get_L1C_sub_stats(struct cache_sub_stats &css) const{
     if(m_L1C)
@@ -1314,7 +1317,13 @@ ldst_unit::process_cache_access( cache_t* cache,
         result = COAL_STALL;
         assert( !read_sent );
         assert( !write_sent );
-        delete mf;
+        m_last_done = mf->get_done(false); // lld: multiple replacement
+        m_last_addr = mf->get_addr();
+        if(m_last_done) {
+            m_last_mf = NULL;
+            delete mf;
+        } else
+            m_last_mf = mf;
     } else {
         assert( status == MISS || status == HIT_RESERVED );
         //inst.clear_active( access.get_warp_mask() ); // threads in mf writeback when mf returns
@@ -1336,6 +1345,14 @@ mem_stage_stall_type ldst_unit::process_memory_access_queue( cache_t *cache, war
 
     //const mem_access_t &access = inst.accessq_back();
     mem_fetch *mf = m_mf_allocator->alloc(inst,inst.accessq_back());
+    if(cache == m_L1D && !m_last_done) { // lld: multiple replacement
+        assert(m_last_mf && mf->get_addr() == m_last_addr);
+        assert(!m_last_mf->get_done(false));
+        delete mf;
+        mf = m_last_mf;
+        //mf->set_done(false, false);
+        m_last_done = true;
+    }
     std::list<cache_event> events;
     enum cache_request_status status = cache->access(mf->get_addr(),mf,gpu_sim_cycle+gpu_tot_sim_cycle,events);
     return process_cache_access( cache, mf->get_addr(), inst, events, mf, status );
@@ -1377,10 +1394,16 @@ bool ldst_unit::memory_cycle( warp_inst_t &inst, mem_stage_stall_type &stall_rea
    if( inst.empty() || 
        ((inst.space.get_type() != global_space) &&
         (inst.space.get_type() != local_space) &&
-        (inst.space.get_type() != param_space_local)) ) 
+        (inst.space.get_type() != param_space_local)) ) {
+       // lld: spare cycles
+       m_L1D->spare_cycle(gpu_sim_cycle+gpu_tot_sim_cycle);
        return true;
-   if( inst.active_count() == 0 ) 
+   }
+   if( inst.active_count() == 0 ) {
+       // lld: spare cycles
+       m_L1D->spare_cycle(gpu_sim_cycle+gpu_tot_sim_cycle);
        return true;
+   }
    assert( !inst.accessq_empty() );
    mem_stage_stall_type stall_cond = NO_RC_FAIL;
    const mem_access_t &access = inst.accessq_back();
@@ -1412,8 +1435,14 @@ bool ldst_unit::memory_cycle( warp_inst_t &inst, mem_stage_stall_type &stall_rea
            } else if( inst.is_store() ) 
               m_core->inc_store_req( inst.warp_id() );
        }
+       // lld: spare cycles
+       m_L1D->spare_cycle(gpu_sim_cycle+gpu_tot_sim_cycle);
    } else {
        assert( CACHE_UNDEFINED != inst.cache_op );
+       if( inst.accessq_empty() ) {
+           // lld: spare cycles
+           m_L1D->spare_cycle(gpu_sim_cycle+gpu_tot_sim_cycle);
+       }
        stall_cond = process_memory_access_queue(m_L1D,inst);
    }
    if( !inst.accessq_empty() ) 
@@ -1586,6 +1615,22 @@ void ldst_unit::init( mem_fetch_interface *icnt,
     m_next_global=NULL;
     m_last_inst_gpu_sim_cycle=0;
     m_last_inst_gpu_tot_sim_cycle=0;
+
+    // lld: multiple replacement
+    m_last_done = true; // lld: multiple replacement
+    m_last_mf = NULL; // lld: multiple replacement
+    // lld: l1 dcache hit latency
+    if(m_config->m_L1D_config.get_replacement_policy() == ADAP_GRAN)
+        m_l1d_pipeline_depth = 26;
+        //m_l1d_pipeline_depth = 1;
+    else
+        m_l1d_pipeline_depth = 24;
+        //m_l1d_pipeline_depth = 0;
+    if(m_l1d_pipeline_depth > 0) {
+        m_l1d_pipeline_reg = new warp_inst_t*[m_l1d_pipeline_depth];
+        for( unsigned i=0; i < m_l1d_pipeline_depth; i++ ) 
+            m_l1d_pipeline_reg[i] = new warp_inst_t( config );
+    }
 }
 
 
@@ -1800,6 +1845,38 @@ void ldst_unit::cycle()
        if( m_pipeline_reg[stage]->empty() && !m_pipeline_reg[stage+1]->empty() )
             move_warp(m_pipeline_reg[stage], m_pipeline_reg[stage+1]);
 
+   // lld: l1 dcache hit latency
+   if(m_l1d_pipeline_depth > 0 && !m_l1d_pipeline_reg[0]->empty()) {
+       warp_inst_t &l1d_pipe_reg = *m_l1d_pipeline_reg[0];
+       unsigned warp_id = l1d_pipe_reg.warp_id();
+       bool pending_requests=false;
+       for( unsigned r=0; r<4; r++ ) {
+           unsigned reg_id = l1d_pipe_reg.out[r];
+           if( reg_id > 0 ) {
+               if( m_pending_writes[warp_id].find(reg_id) != m_pending_writes[warp_id].end() ) {
+                   if ( m_pending_writes[warp_id][reg_id] > 0 ) {
+                       pending_requests=true;
+                       break;
+                   } else {
+                       // this instruction is done already
+                       m_pending_writes[warp_id].erase(reg_id); 
+                   }
+               }
+           }
+       }
+       if( !pending_requests ) {
+           m_core->warp_inst_complete(*m_l1d_pipeline_reg[0]);
+           m_scoreboard->releaseRegisters(m_l1d_pipeline_reg[0]);
+       }
+       m_core->dec_inst_in_pipeline(warp_id);
+       m_l1d_pipeline_reg[0]->clear();
+   }
+
+   // lld: l1 dcache hit latency
+   for( unsigned stage=0; (stage+1)<m_l1d_pipeline_depth; stage++ ) 
+       if( m_l1d_pipeline_reg[stage]->empty() && !m_l1d_pipeline_reg[stage+1]->empty() )
+            move_warp(m_l1d_pipeline_reg[stage], m_l1d_pipeline_reg[stage+1]);
+
    if( !m_response_fifo.empty() ) {
        mem_fetch *mf = m_response_fifo.front();
        if (mf->istexture()) {
@@ -1874,6 +1951,13 @@ void ldst_unit::cycle()
                    move_warp(m_pipeline_reg[2],m_dispatch_reg);
                    m_dispatch_reg->clear();
                }
+           } else if( m_l1d_pipeline_depth > 0 && (pipe_reg.space.get_type() == global_space ||
+                                                   pipe_reg.space.get_type() == local_space ||
+                                                   pipe_reg.space.get_type() == param_space_local) ) {
+               // lld: l1 dcache hit latency
+               assert( m_l1d_pipeline_reg[m_l1d_pipeline_depth-1]->empty() );
+               move_warp(m_l1d_pipeline_reg[m_l1d_pipeline_depth-1],m_dispatch_reg);
+               m_dispatch_reg->clear();
            } else {
                //if( pipe_reg.active_count() > 0 ) {
                //    if( !m_operand_collector->writeback(pipe_reg) ) 
@@ -1919,8 +2003,9 @@ void shader_core_ctx::register_cta_thread_exit( unsigned cta_num )
       m_n_active_cta--;
       m_barriers.deallocate_barrier(cta_num);
       shader_CTA_count_unlog(m_sid, 1);
-      printf("GPGPU-Sim uArch: Shader %d finished CTA #%d (%lld,%lld), %u CTAs running\n", m_sid, cta_num, gpu_sim_cycle, gpu_tot_sim_cycle,
-             m_n_active_cta );
+      // lld
+      //printf("GPGPU-Sim uArch: Shader %d finished CTA #%d (%lld,%lld), %u CTAs running\n", m_sid, cta_num, gpu_sim_cycle, gpu_tot_sim_cycle,
+      //       m_n_active_cta );
       if( m_n_active_cta == 0 ) {
           assert( m_kernel != NULL );
           m_kernel->dec_running();
@@ -2045,6 +2130,37 @@ void gpgpu_sim::shader_print_cache_stats( FILE *fout ) const{
         }
         fprintf(fout, "\tL1D_total_cache_pending_hits = %u\n", total_css.pending_hits);
         fprintf(fout, "\tL1D_total_cache_reservation_fails = %u\n", total_css.res_fails);
+        // lld
+        if(total_css.miss_repl)
+            fprintf(fout, "\tL1D_total_cache_miss_replacement = %u\n", total_css.miss_repl);
+        if(total_css.partial_misses)
+            fprintf(fout, "\tL1D_total_cache_partial_misses = %u\n", total_css.partial_misses);
+        if(total_css.partial_miss_repl)
+            fprintf(fout, "\tL1D_total_cache_partial_miss_replacement = %u\n", total_css.partial_miss_repl);
+        fprintf(fout, "\tL1D_total_cache_miss_fills = %u\n", total_css.fills);
+        if(total_css.fills)
+            fprintf(fout, "\tL1D_total_cache_miss_fill_average_latency = %.2f\n", (double)total_css.total_lat/(double)total_css.fills);
+        fprintf(fout, "\tL1D_total_cache_hit_fills = %u\n", total_css.hit_fills);
+        if(total_css.hit_fills)
+            fprintf(fout, "\tL1D_total_cache_hit_fill_average_latency = %.2f\n", (double)total_css.total_hit_lat/(double)total_css.hit_fills);
+        fprintf(fout, "\tL1D_total_mshr_size_full = %u\n", total_css.mshr_size_full);
+        fprintf(fout, "\tL1D_total_mshr_list_full = %u\n", total_css.mshr_list_full);
+        if(total_css.prefetches || total_css.useful_prefetches || total_css.useless_prefetches || total_css.desired_prefetches) {
+            fprintf(fout, "\tL1D_total_prefetches = %u\n", total_css.prefetches);
+            fprintf(fout, "\tL1D_total_useful_prefetches = %u\n", total_css.useful_prefetches);
+            fprintf(fout, "\tL1D_total_useless_prefetches = %u\n", total_css.useless_prefetches);
+            fprintf(fout, "\tL1D_total_desired_prefetches = %u\n", total_css.desired_prefetches);
+        }
+        for(unsigned i = 0; i <= m_shader_config->m_L1D_config.get_line_sz(); i++)
+            if(total_css.reuse[i])
+                fprintf(fout, "\tL1D_total_intra_line_reuse[%u] = %u\n", i, total_css.reuse[i]);
+        for(unsigned i = 0; i <= m_shader_config->m_L1D_config.get_line_sz() / CACHE_CHUNK_SIZE; i++)
+            fprintf(fout, "\tL1D_total_intra_line_chunk_reuse[%u] = %u\n", i, total_css.chunk_reuse[i]);
+        for(unsigned i = 0; i <= m_shader_config->m_L1D_config.get_line_sz() / CACHE_CHUNK_SIZE; i++)
+            fprintf(fout, "\tL1D_total_intra_line_continuous_chunk_reuse[%u] = %u\n", i, total_css.chunk_cont_reuse[i]);
+        for(unsigned i = 0; i < NUM_CACHE_REPL_STATS; i++)
+            if(total_css.repl_stats[i])
+                fprintf(fout, "\tL1D_total_stats[%s] = %u\n", cache_repl_stats_str((enum cache_repl_stats)i), total_css.repl_stats[i]);
         total_css.print_port_stats(fout, "\tL1D_cache"); 
     }
 
@@ -3281,6 +3397,8 @@ void simt_core_cluster::icnt_inject_request_packet(class mem_fetch *mf)
     case L2_WRBK_ACC: m_stats->gpgpu_n_mem_l2_writeback++; break;
     case L1_WR_ALLOC_R: m_stats->gpgpu_n_mem_l1_write_allocate++; break;
     case L2_WR_ALLOC_R: m_stats->gpgpu_n_mem_l2_write_allocate++; break;
+    case L1_PREF_ACC_R: m_stats->gpgpu_n_mem_l1_pref++; break; // lld
+    case L2_PREF_ACC_R: m_stats->gpgpu_n_mem_l2_pref++; break; // lld
     default: assert(0);
     }
 

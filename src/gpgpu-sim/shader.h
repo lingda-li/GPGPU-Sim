@@ -1183,6 +1183,14 @@ protected:
    // for debugging
    unsigned long long m_last_inst_gpu_sim_cycle;
    unsigned long long m_last_inst_gpu_tot_sim_cycle;
+
+   // lld: multiple replacement
+   mem_fetch *m_last_mf;
+   bool m_last_done;
+   new_addr_type m_last_addr;
+   // lld: l1 dcache hit latency
+   warp_inst_t **m_l1d_pipeline_reg;
+   unsigned m_l1d_pipeline_depth;
 };
 
 enum pipeline_stage_name_t {
@@ -1251,6 +1259,7 @@ struct shader_core_config : public core_config
         m_L1D_config.init(m_L1D_config.m_config_string,FuncCachePreferNone);
         gpgpu_cache_texl1_linesize = m_L1T_config.get_line_sz();
         gpgpu_cache_constl1_linesize = m_L1C_config.get_line_sz();
+        gpgpu_cache_datal1_linesize = m_L1D_config.get_line_sz(); // lld
         m_valid = true;
     }
     void reg_options(class OptionParser * opp );
@@ -1398,6 +1407,8 @@ struct shader_core_stats_pod {
     int gpgpu_n_mem_l2_writeback;
     int gpgpu_n_mem_l1_write_allocate; 
     int gpgpu_n_mem_l2_write_allocate;
+    int gpgpu_n_mem_l1_pref; // lld
+    int gpgpu_n_mem_l2_pref; // lld
 
     unsigned made_write_mfs;
     unsigned made_read_mfs;

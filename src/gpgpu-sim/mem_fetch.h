@@ -32,6 +32,15 @@
 #include "../abstract_hardware_model.h"
 #include <bitset>
 
+enum cache_request_status {
+    HIT = 0,
+    HIT_RESERVED,
+    MISS,
+    MISS_PARTIAL, // lld: sector cache
+    RESERVATION_FAIL, 
+    NUM_CACHE_REQUEST_STATUS
+};
+
 enum mf_type {
    READ_REQUEST = 0,
    WRITE_REQUEST,
@@ -100,11 +109,59 @@ public:
    unsigned get_return_timestamp() const { return m_timestamp2; }
    unsigned get_icnt_receive_time() const { return m_icnt_receive_time; }
 
+   // lld: for memory latency calculation
+   void set_issue(bool l2) { if(l2) m_l2_issue=true; else m_issue=true; }
+   bool get_issue(bool l2) const { if(l2) return m_l2_issue; else return m_issue; }
+   void set_issue_time( bool l2, unsigned t ) { if(l2) m_l2_issue_time=t; else m_l1_issue_time=t; }
+   void set_ret_time( bool l2, unsigned t ) { if(l2) m_l2_ret_time=t; else m_l1_ret_time=t; }
+   unsigned get_issue_time(bool l2) const { if(l2) return m_l2_issue_time; else return m_l1_issue_time; }
+   unsigned get_ret_time(bool l2) const { if(l2) return m_l2_ret_time; else return m_l1_ret_time; }
+
+   // lld: additional information
+   void set_access_status( bool l2, cache_request_status status ) { if(l2) m_l2_status=status; else m_l1_status=status; }
+   cache_request_status get_status( bool l2 ) { if(l2) return m_l2_status; else return m_l1_status; }
+   std::bitset<MAX_CACHE_CHUNK_NUM> get_original_sector_mask( bool l2 ) const { if(l2) return m_l2_original_sector_mask; else return m_original_sector_mask; }
+   void set_original_sector_mask(bool l2) { assert((!l2 && !m_l1_combination) || (l2 && !m_l2_combination));
+                                            if(!l2) m_original_sector_mask = m_sector_mask; m_l2_original_sector_mask = m_l2_sector_mask; }
+   std::bitset<MAX_CACHE_CHUNK_NUM> get_sector_mask( bool l2 ) const { if(l2) return m_l2_sector_mask; else return m_sector_mask; }
+   void set_sector_mask(bool l2, unsigned i, bool value) { if(!l2) { if(value) m_sector_mask.set(i); else m_sector_mask.reset(i); }
+                                                           if(value) m_l2_sector_mask.set(i); else m_l2_sector_mask.reset(i); }
+   std::bitset<MAX_CACHE_CHUNK_NUM> get_alloc_sector_mask( bool l2 ) const { if(l2) return m_l2_alloc_sector_mask; else return m_alloc_sector_mask; }
+   void set_alloc_sector_mask(bool l2, unsigned i, bool value) { if(!l2) { if(value) m_alloc_sector_mask.set(i); else m_alloc_sector_mask.reset(i); }
+                                                           if(value) m_l2_alloc_sector_mask.set(i); else m_l2_alloc_sector_mask.reset(i); }
+   bool get_alloc_on_fill(bool l2) { if(l2) return m_l2_alloc_on_fill; else return m_l1_alloc_on_fill; }
+   void set_alloc_on_fill(bool l2) { if(l2) m_l2_alloc_on_fill = true; else m_l1_alloc_on_fill = true; }
+   bool get_prefetch(bool l2) { if(l2) return m_l2_prefetch; else return m_l1_prefetch; }
+   int get_sign() { return m_sign; }
+   void set_prefetch_info(bool l2, address_type pc, int sign) { if(l2) m_l2_prefetch=true; else m_l1_prefetch=true;
+                                                                          m_my_pc = pc; m_sign = sign; }
+   void set_done(bool l2, bool value) { if(l2) m_l2_done=value; else m_l1_done=value; }
+   bool get_done(bool l2) { if(l2) return m_l2_done; else return m_l1_done; }
+   void set_write_sent(bool l2) { if(l2) m_l2_write_sent=true; else m_l1_write_sent=true; }
+   bool get_write_sent(bool l2) { if(l2) return m_l2_write_sent; else return m_l1_write_sent; }
+   bool get_first_touch(bool l2)
+   {
+       if(l2 && m_l2_first_touch) {
+           m_l2_first_touch = false;
+           return true;
+       } else if(!l2 && m_l1_first_touch) {
+           m_l1_first_touch = false;
+           return true;
+       }
+       return false;
+   }
+
+   std::list<mem_fetch*> m_merged_requests; // lld: adaptive granularity
+
    enum mem_access_type get_access_type() const { return m_access.get_type(); }
    const active_mask_t& get_access_warp_mask() const { return m_access.get_warp_mask(); }
    mem_access_byte_mask_t get_access_byte_mask() const { return m_access.get_byte_mask(); }
+   void set_access_byte_mask(unsigned i, bool value) { m_access.set_byte_mask(i, value); } // lld: sector cache
+   unsigned get_combination(bool l2) { if(l2) return m_l2_combination; else return m_l1_combination; }
+   void inc_combination(bool l2) { if(l2) m_l2_combination++; else m_l1_combination++; }
 
-   address_type get_pc() const { return m_inst.empty()?-1:m_inst.pc; }
+   address_type get_pc() const { if(get_access_type() == L1_PREF_ACC_R || get_access_type() == L2_PREF_ACC_R) return m_my_pc; // lld: for prefetch
+                                 else return m_inst.empty()?-1:m_inst.pc; }
    const warp_inst_t &get_inst() { return m_inst; }
    enum mem_fetch_status get_status() const { return m_status; }
 
@@ -134,6 +191,36 @@ private:
    unsigned m_timestamp;  // set to gpu_sim_cycle+gpu_tot_sim_cycle at struct creation
    unsigned m_timestamp2; // set to gpu_sim_cycle+gpu_tot_sim_cycle when pushed onto icnt to shader; only used for reads
    unsigned m_icnt_receive_time; // set to gpu_sim_cycle + interconnect_latency when fixed icnt latency mode is enabled
+
+   // lld
+   address_type m_my_pc;
+   int m_sign;
+   bool m_issue;
+   bool m_l2_issue;
+   unsigned m_l1_issue_time;
+   unsigned m_l2_issue_time;
+   unsigned m_l1_ret_time;
+   unsigned m_l2_ret_time;
+   cache_request_status m_l1_status;
+   cache_request_status m_l2_status;
+   std::bitset<MAX_CACHE_CHUNK_NUM> m_original_sector_mask; // lld: sector cache
+   std::bitset<MAX_CACHE_CHUNK_NUM> m_sector_mask; // lld: sector cache
+   std::bitset<MAX_CACHE_CHUNK_NUM> m_alloc_sector_mask; // lld: adaptive line size
+   std::bitset<MAX_CACHE_CHUNK_NUM> m_l2_original_sector_mask; // lld: sector cache
+   std::bitset<MAX_CACHE_CHUNK_NUM> m_l2_sector_mask; // lld: sector cache
+   std::bitset<MAX_CACHE_CHUNK_NUM> m_l2_alloc_sector_mask; // lld: adaptive line size
+   unsigned m_l1_combination;
+   unsigned m_l2_combination;
+   bool m_l1_alloc_on_fill;
+   bool m_l2_alloc_on_fill;
+   bool m_l1_prefetch;
+   bool m_l2_prefetch;
+   bool m_l1_done;
+   bool m_l2_done;
+   bool m_l1_write_sent;
+   bool m_l2_write_sent;
+   bool m_l1_first_touch;
+   bool m_l2_first_touch;
 
    // requesting instruction (put last so mem_fetch prints nicer in gdb)
    warp_inst_t m_inst;

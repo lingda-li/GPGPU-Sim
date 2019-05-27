@@ -319,7 +319,10 @@ void warp_inst_t::generate_mem_accesses()
                memory_coalescing_arch_13_atomic(is_write, access_type);
            else
                memory_coalescing_arch_13(is_write, access_type);
-        } else abort();
+        }
+        else if( m_config->gpgpu_coalesce_arch == 1 ) // lld
+            cache_block_size = m_config->gpgpu_cache_datal1_linesize;
+        else abort();
 
         break;
 
@@ -357,11 +360,28 @@ void warp_inst_t::memory_coalescing_arch_13( bool is_write, mem_access_type acce
     // see the CUDA manual where it discusses coalescing rules before reading this
     unsigned segment_size = 0;
     unsigned warp_parts = m_config->mem_warp_parts;
-    switch( data_size ) {
-    case 1: segment_size = 32; break;
-    case 2: segment_size = 64; break;
-    case 4: case 8: case 16: segment_size = 128; break;
-    }
+    // lld: various cache line size
+    if( m_config->gpgpu_cache_datal1_linesize == 128 )
+        switch( data_size ) {
+        case 1: segment_size = 32; break;
+        case 2: segment_size = 64; break;
+        case 4: case 8: case 16: segment_size = 128; break;
+        }
+    else if( m_config->gpgpu_cache_datal1_linesize == 256 )
+        switch( data_size ) {
+        case 1: segment_size = 32; break;
+        case 2: segment_size = 64; break;
+        case 4: segment_size = 128; break;
+        case 8: case 16: segment_size = 256; break;
+        }
+    else if( m_config->gpgpu_cache_datal1_linesize == 32 )
+        segment_size = 32;
+    else if( m_config->gpgpu_cache_datal1_linesize == 64 )
+        switch( data_size ) {
+        case 1: segment_size = 32; break;
+        default: segment_size = 64; break;
+        }
+    else abort();
     unsigned subwarp_size = m_config->warp_size / warp_parts;
 
     for( unsigned subwarp=0; subwarp <  warp_parts; subwarp++ ) {
@@ -390,7 +410,8 @@ void warp_inst_t::memory_coalescing_arch_13( bool is_write, mem_access_type acce
             for(unsigned access=0; access<num_accesses; access++) {
                 new_addr_type addr = m_per_scalar_thread[thread].memreqaddr[access];
                 unsigned block_address = line_size_based_tag_func(addr,segment_size);
-                unsigned chunk = (addr&127)/32; // which 32-byte chunk within in a 128-byte chunk does this thread access?
+                //unsigned chunk = (addr&127)/32; // which 32-byte chunk within in a 128-byte chunk does this thread access?
+                unsigned chunk = (addr&(m_config->gpgpu_cache_datal1_linesize-1))/32; // lld: which 32-byte chunk does this thread access?
                 transaction_info &info = subwarp_transactions[block_address];
 
                 // can only write to one segment
@@ -398,7 +419,8 @@ void warp_inst_t::memory_coalescing_arch_13( bool is_write, mem_access_type acce
 
                 info.chunks.set(chunk);
                 info.active.set(thread);
-                unsigned idx = (addr&127);
+                //unsigned idx = (addr&127);
+                unsigned idx = (addr&(m_config->gpgpu_cache_datal1_linesize-1)); // lld
                 for( unsigned i=0; i < data_size_coales; i++ )
                     info.bytes.set(idx+i);
             }
@@ -424,11 +446,28 @@ void warp_inst_t::memory_coalescing_arch_13_atomic( bool is_write, mem_access_ty
    // see the CUDA manual where it discusses coalescing rules before reading this
    unsigned segment_size = 0;
    unsigned warp_parts = 2;
-   switch( data_size ) {
-   case 1: segment_size = 32; break;
-   case 2: segment_size = 64; break;
-   case 4: case 8: case 16: segment_size = 128; break;
-   }
+    // lld: various cache line size
+    if( m_config->gpgpu_cache_datal1_linesize == 128 )
+        switch( data_size ) {
+        case 1: segment_size = 32; break;
+        case 2: segment_size = 64; break;
+        case 4: case 8: case 16: segment_size = 128; break;
+        }
+    else if( m_config->gpgpu_cache_datal1_linesize == 256 )
+        switch( data_size ) {
+        case 1: segment_size = 32; break;
+        case 2: segment_size = 64; break;
+        case 4: segment_size = 128; break;
+        case 8: case 16: segment_size = 256; break;
+        }
+    else if( m_config->gpgpu_cache_datal1_linesize == 32 )
+        segment_size = 32;
+    else if( m_config->gpgpu_cache_datal1_linesize == 64 )
+        switch( data_size ) {
+        case 1: segment_size = 32; break;
+        default: segment_size = 64; break;
+        }
+    else abort();
    unsigned subwarp_size = m_config->warp_size / warp_parts;
 
    for( unsigned subwarp=0; subwarp <  warp_parts; subwarp++ ) {
@@ -441,7 +480,8 @@ void warp_inst_t::memory_coalescing_arch_13_atomic( bool is_write, mem_access_ty
 
            new_addr_type addr = m_per_scalar_thread[thread].memreqaddr[0];
            unsigned block_address = line_size_based_tag_func(addr,segment_size);
-           unsigned chunk = (addr&127)/32; // which 32-byte chunk within in a 128-byte chunk does this thread access?
+           //unsigned chunk = (addr&127)/32; // which 32-byte chunk within in a 128-byte chunk does this thread access?
+           unsigned chunk = (addr&(m_config->gpgpu_cache_datal1_linesize-1))/32; // lld: which 32-byte chunk within in a 128-byte chunk does this thread access?
 
            // can only write to one segment
            assert(block_address == line_size_based_tag_func(addr+data_size-1,segment_size));
@@ -451,7 +491,8 @@ void warp_inst_t::memory_coalescing_arch_13_atomic( bool is_write, mem_access_ty
            std::list<transaction_info>::iterator it;
            transaction_info* info;
            for(it=subwarp_transactions[block_address].begin(); it!=subwarp_transactions[block_address].end(); it++) {
-              unsigned idx = (addr&127);
+              //unsigned idx = (addr&127);
+              unsigned idx = (addr&(m_config->gpgpu_cache_datal1_linesize-1)); // lld
               if(not it->test_bytes(idx,idx+data_size-1)) {
                  new_transaction = false;
                  info = &(*it);
@@ -467,7 +508,8 @@ void warp_inst_t::memory_coalescing_arch_13_atomic( bool is_write, mem_access_ty
 
            info->chunks.set(chunk);
            info->active.set(thread);
-           unsigned idx = (addr&127);
+           //unsigned idx = (addr&127);
+           unsigned idx = (addr&(m_config->gpgpu_cache_datal1_linesize-1)); // lld
            for( unsigned i=0; i < data_size; i++ ) {
                assert(!info->bytes.test(idx+i));
                info->bytes.set(idx+i);
@@ -495,37 +537,71 @@ void warp_inst_t::memory_coalescing_arch_13_reduce_and_send( bool is_write, mem_
 {
    assert( (addr & (segment_size-1)) == 0 );
 
-   const std::bitset<4> &q = info.chunks;
+   //const std::bitset<4> &q = info.chunks;
+   const std::bitset<8> &q = info.chunks; // lld
    assert( q.count() >= 1 );
    std::bitset<2> h; // halves (used to check if 64 byte segment can be compressed into a single 32 byte segment)
 
    unsigned size=segment_size;
-   if( segment_size == 128 ) {
-       bool lower_half_used = q[0] || q[1];
-       bool upper_half_used = q[2] || q[3];
+   // lld: for larger line size
+   int base = 0;
+   if( segment_size == 256 ) {
+       bool lower_half_used = q[0] || q[1] || q[2] || q[3];
+       bool upper_half_used = q[4] || q[5] || q[6] || q[7];
+       if( lower_half_used && !upper_half_used ) {
+           // only lower 128 bytes used
+           size = 128;
+           if(q[0] || q[1]) h.set(0);
+           if(q[2] || q[3]) h.set(1);
+       } else if ( (!lower_half_used) && upper_half_used ) {
+           // only upper 128 bytes used
+           addr = addr+128;
+           size = 128;
+           base = 4;
+           if(q[4] || q[5]) h.set(0);
+           if(q[6] || q[7]) h.set(1);
+       } else {
+           assert(lower_half_used && upper_half_used);
+       }
+   } else if( segment_size == 128 ) {
+       base = (addr % m_config->gpgpu_cache_datal1_linesize) / 32; // lld
+       bool lower_half_used = q[base+0] || q[base+1];
+       bool upper_half_used = q[base+2] || q[base+3];
        if( lower_half_used && !upper_half_used ) {
            // only lower 64 bytes used
            size = 64;
-           if(q[0]) h.set(0);
-           if(q[1]) h.set(1);
+           if(q[base+0]) h.set(0);
+           if(q[base+1]) h.set(1);
        } else if ( (!lower_half_used) && upper_half_used ) {
            // only upper 64 bytes used
            addr = addr+64;
            size = 64;
-           if(q[2]) h.set(0);
-           if(q[3]) h.set(1);
+           if(q[base+2]) h.set(0);
+           if(q[base+3]) h.set(1);
        } else {
            assert(lower_half_used && upper_half_used);
        }
    } else if( segment_size == 64 ) {
        // need to set halves
-       if( (addr % 128) == 0 ) {
-           if(q[0]) h.set(0);
-           if(q[1]) h.set(1);
+       base = (addr % m_config->gpgpu_cache_datal1_linesize) / 32; // lld
+       if(q[base+0]) h.set(0);
+       if(q[base+1]) h.set(1);
+   }
+   // lld: for larger line size
+   if( segment_size == 256 && size == 128 ) {
+       bool lower_half_used = h[0];
+       bool upper_half_used = h[1];
+       if( lower_half_used && !upper_half_used ) {
+           size = 64;
+           if(q[base+0]) h.set(0);
+           if(q[base+1]) h.set(1);
+       } else if ( (!lower_half_used) && upper_half_used ) {
+           addr = addr+64;
+           size = 64;
+           if(q[base+2]) h.set(0);
+           if(q[base+3]) h.set(1);
        } else {
-           assert( (addr % 128) == 64 );
-           if(q[2]) h.set(0);
-           if(q[3]) h.set(1);
+           assert(lower_half_used && upper_half_used);
        }
    }
    if( size == 64 ) {

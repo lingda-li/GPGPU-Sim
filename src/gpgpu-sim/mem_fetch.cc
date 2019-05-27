@@ -61,6 +61,40 @@ mem_fetch::mem_fetch( const mem_access_t &access,
    m_status_change = gpu_sim_cycle + gpu_tot_sim_cycle;
    m_mem_config = config;
    icnt_flit_size = config->icnt_flit_size;
+
+   // lld: for memory latency calculation
+   m_issue = false;
+   m_l2_issue = false;
+   m_l1_issue_time = 0;
+   m_l2_issue_time = 0;
+   m_l1_ret_time = 0;
+   m_l2_ret_time = 0;
+   m_l1_status = NUM_CACHE_REQUEST_STATUS;
+   m_l2_status = NUM_CACHE_REQUEST_STATUS;
+   for(unsigned i = 0; i < MAX_CACHE_CHUNK_NUM; i++) {
+       for(unsigned j = 0; j < CACHE_CHUNK_SIZE; j++)
+           if(m_access.get_byte_mask().test(i*CACHE_CHUNK_SIZE+j)) {
+               m_original_sector_mask.set(i);
+               m_sector_mask.set(i);
+               m_alloc_sector_mask.set(i);
+               m_l2_original_sector_mask.set(i);
+               m_l2_sector_mask.set(i);
+               m_l2_alloc_sector_mask.set(i);
+               break;
+           }
+   }
+   m_l1_combination = 0;
+   m_l2_combination = 0;
+   m_l1_alloc_on_fill = false;
+   m_l2_alloc_on_fill = false;
+   m_l1_prefetch = false;
+   m_l2_prefetch = false;
+   m_l1_done = true;
+   m_l2_done = true;
+   m_l1_write_sent = false;
+   m_l2_write_sent = false;
+   m_l1_first_touch = true;
+   m_l2_first_touch = true;
 }
 
 mem_fetch::~mem_fetch()
@@ -82,7 +116,7 @@ void mem_fetch::print( FILE *fp, bool print_inst ) const
         fprintf(fp," <NULL mem_fetch pointer>\n");
         return;
     }
-    fprintf(fp,"  mf: uid=%6u, sid%02u:w%02u, part=%u, ", m_request_uid, m_sid, m_wid, m_raw_addr.chip );
+    fprintf(fp,"  mf %p: uid=%6u, sid%02u:w%02u, part=%u, ", this, m_request_uid, m_sid, m_wid, m_raw_addr.chip );
     m_access.print(fp);
     if( (unsigned)m_status < NUM_MEM_REQ_STAT ) 
        fprintf(fp," status = %s (%llu), ", Status_str[m_status], m_status_change );

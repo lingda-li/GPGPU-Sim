@@ -41,15 +41,8 @@ enum cache_block_state {
     INVALID,
     RESERVED,
     VALID,
-    MODIFIED
-};
-
-enum cache_request_status {
-    HIT = 0,
-    HIT_RESERVED,
-    MISS,
-    RESERVATION_FAIL, 
-    NUM_CACHE_REQUEST_STATUS
+    MODIFIED,
+    UNUSED // lld: currently unused block, cannot be used by any line
 };
 
 enum cache_event {
@@ -69,8 +62,18 @@ struct cache_block_t {
         m_fill_time=0;
         m_last_access_time=0;
         m_status=INVALID;
+        // lld
+        m_prefetch = false;
+        m_sector_mask.reset();
+        m_ready_sector_mask.reset();
+        m_original_sector_mask.reset();
+        m_pref_sector_mask.reset();
+        m_wid = 0;
+        m_reuse.reset();
+        m_size = 0;
+        m_warn_time = 0;
     }
-    void allocate( new_addr_type tag, new_addr_type block_addr, unsigned time )
+    void allocate( new_addr_type tag, new_addr_type block_addr, unsigned time, unsigned wid )
     {
         m_tag=tag;
         m_block_addr=block_addr;
@@ -78,8 +81,18 @@ struct cache_block_t {
         m_last_access_time=time;
         m_fill_time=0;
         m_status=RESERVED;
+        // lld
+        m_prefetch = false;
+        m_sector_mask.reset();
+        m_ready_sector_mask.reset();
+        m_original_sector_mask.reset();
+        m_pref_sector_mask.reset();
+        m_wid = wid;
+        m_reuse.reset();
+        m_size = 0;
+        m_warn_time = time;
     }
-    void fill( unsigned time )
+    void fill( unsigned time, unsigned wid )
     {
         assert( m_status == RESERVED );
         m_status=VALID;
@@ -92,11 +105,54 @@ struct cache_block_t {
     unsigned         m_last_access_time;
     unsigned         m_fill_time;
     cache_block_state    m_status;
+
+    // lld
+    bool m_prefetch;
+    std::bitset<MAX_CACHE_CHUNK_NUM> m_sector_mask;
+    std::bitset<MAX_CACHE_CHUNK_NUM> m_ready_sector_mask;
+    std::bitset<MAX_CACHE_CHUNK_NUM> m_original_sector_mask;
+    std::bitset<MAX_CACHE_CHUNK_NUM> m_pref_sector_mask;
+    unsigned m_size;
+    unsigned m_wid;
+    mem_access_byte_mask_t m_reuse;
+    unsigned         m_warn_time;
+};
+
+// lld: cache set
+struct cache_set_t {
+    ~cache_set_t()
+    {
+        delete[] m_idx;
+    }
+    void init(unsigned max_line)
+    {
+        m_line_num = 0;
+        m_size = 0;
+        m_idx = new unsigned[max_line];
+        for(unsigned i = 0; i < max_line; i++)
+            m_idx[i] = (unsigned)-1;
+    }
+    void reset(unsigned max_line)
+    {
+        m_line_num = 0;
+        m_size = 0;
+        for(unsigned i = 0; i < max_line; i++)
+            m_idx[i] = (unsigned)-1;
+    }
+
+    unsigned m_line_num;
+    unsigned m_size; // number of chunk
+    unsigned *m_idx;
 };
 
 enum replacement_policy_t {
     LRU,
-    FIFO
+    FIFO,
+    MY_REPL,
+    SECTOR,
+    ADAP_GRAN,
+    PREF,
+    PARTITION
 };
 
 enum write_policy_t {
@@ -120,7 +176,9 @@ enum write_allocate_policy_t {
 
 enum mshr_config_t {
     TEX_FIFO,
-    ASSOC // normal cache 
+    ASSOC, // normal cache 
+    SECTOR_MSHR, // lld: sector cache mshr
+    LARGE_MSHR // lld: large granularity mshr
 };
 
 enum set_index_function{
@@ -154,6 +212,7 @@ public:
                           &m_miss_queue_size, &m_result_fifo_entries,
                           &m_data_port_width);
 
+        m_true_assoc = m_assoc; // lld: adaptive granularity
         if ( ntok < 11 ) {
             if ( !strcmp(config,"none") ) {
                 m_disabled = true;
@@ -161,9 +220,15 @@ public:
             }
             exit_parse_error();
         }
+        m_enable_prefetch = false;
         switch (rp) {
-        case 'L': m_replacement_policy = LRU; break;
-        case 'F': m_replacement_policy = FIFO; break;
+        case 'L': m_replacement_policy = LRU; m_custom_repl=2; break;
+        case 'F': m_replacement_policy = FIFO; m_custom_repl=2; break;
+        case 'M': m_replacement_policy = MY_REPL; m_custom_repl=1; break;
+        case 'S': m_replacement_policy = SECTOR; m_custom_repl=0; break;
+        case 'G': m_replacement_policy = ADAP_GRAN; m_custom_repl=1; m_assoc*=m_line_sz/CACHE_CHUNK_SIZE; break;
+        case 'P': m_replacement_policy = PREF; m_custom_repl=1; m_enable_prefetch=true; break;
+        case 'T': m_replacement_policy = PARTITION; m_custom_repl=1; break;
         default: exit_parse_error();
         }
         switch (wp) {
@@ -181,7 +246,17 @@ public:
         }
         switch (mshr_type) {
         case 'F': m_mshr_type = TEX_FIFO; assert(ntok==13); break;
-        case 'A': m_mshr_type = ASSOC; break;
+        case 'A':
+            if(m_replacement_policy == SECTOR)
+                m_mshr_type = SECTOR_MSHR;
+            else if(m_replacement_policy == ADAP_GRAN)
+                //m_mshr_type = LARGE_MSHR;
+                m_mshr_type = SECTOR_MSHR;
+            else if(m_replacement_policy == PREF)
+                m_mshr_type = LARGE_MSHR;
+            else
+                m_mshr_type = ASSOC;
+            break;
         default: exit_parse_error();
         }
         m_line_sz_log2 = LOGB2(m_line_sz);
@@ -208,11 +283,21 @@ public:
             assert(0 && "Invalid cache configuration: Writeback cache cannot allocate new line on fill. "); 
         }
 
+        // lld: set coalescing granularity
+        if(m_mshr_type == LARGE_MSHR)
+            m_coalesce_line_sz = 128;
+        else
+            m_coalesce_line_sz = m_line_sz;
+        assert(m_line_sz % CACHE_CHUNK_SIZE == 0);
+        assert(m_coalesce_line_sz % m_line_sz == 0);
+        m_extra_accessq_size = 16;
+
         // default: port to data array width and granularity = line size 
         if (m_data_port_width == 0) {
-            m_data_port_width = m_line_sz; 
+            //m_data_port_width = m_line_sz; 
+            m_data_port_width = m_coalesce_line_sz; // lld
         }
-        assert(m_line_sz % m_data_port_width == 0); 
+        //assert(m_line_sz % m_data_port_width == 0); // lld
 
         switch(sif){
         case 'H': m_set_index_function = FERMI_HASH_SET_FUNCTION; break;
@@ -266,7 +351,17 @@ public:
         return addr & ~(m_line_sz-1);
     }
     FuncCache get_cache_status() {return cache_status;}
+
+    // lld: adaptive coalescing cache
+    replacement_policy_t get_replacement_policy() { return m_replacement_policy; }
+    unsigned get_coalesce_line_sz() const { assert( m_valid ); return m_coalesce_line_sz; }
+    new_addr_type coalesced_block_addr( new_addr_type addr ) const
+    {
+        return addr & ~(m_coalesce_line_sz-1);
+    }
+
     char *m_config_string;
+    char *m_config_repl_string; // lld: replacement configuration
     char *m_config_stringPrefL1;
     char *m_config_stringPrefShared;
     FuncCache cache_status;
@@ -285,8 +380,12 @@ protected:
     unsigned m_nset;
     unsigned m_nset_log2;
     unsigned m_assoc;
+    unsigned m_true_assoc; // lld: adaptive granularity
+    unsigned m_coalesce_line_sz; // lld: memory coalescing granularity
 
     enum replacement_policy_t m_replacement_policy; // 'L' = LRU, 'F' = FIFO
+                                                    // 'M' = MY_REPL, 'S' = SECTOR, 'G' = ADAP_GRAN, 'P' = PREF, 'T' = PARTITION
+    unsigned m_custom_repl; // lld: 0 = lru, 1 = custom, 2 = other
     enum write_policy_t m_write_policy;             // 'T' = write through, 'B' = write back, 'R' = read only
     enum allocation_policy_t m_alloc_policy;        // 'm' = allocate on miss, 'f' = allocate on fill
     enum mshr_config_t m_mshr_type;
@@ -305,6 +404,8 @@ protected:
         unsigned m_miss_queue_size;
         unsigned m_rob_entries;
     };
+    bool m_enable_prefetch;
+    unsigned m_extra_accessq_size; // lld: extra access queue size
     unsigned m_result_fifo_entries;
     unsigned m_data_port_width; //< number of byte the cache can access per cycle 
     enum set_index_function m_set_index_function; // Hash, linear, or custom set index function
@@ -316,6 +417,7 @@ protected:
     friend class data_cache;
     friend class l1_cache;
     friend class l2_cache;
+    friend class BypassMonitor; // lld
 };
 
 class l1d_cache_config : public cache_config{
@@ -334,59 +436,8 @@ private:
 	linear_to_raw_address_translation *m_address_mapping;
 };
 
-class tag_array {
-public:
-    // Use this constructor
-    tag_array(cache_config &config, int core_id, int type_id );
-    ~tag_array();
-
-    enum cache_request_status probe( new_addr_type addr, unsigned &idx ) const;
-    enum cache_request_status access( new_addr_type addr, unsigned time, unsigned &idx );
-    enum cache_request_status access( new_addr_type addr, unsigned time, unsigned &idx, bool &wb, cache_block_t &evicted );
-
-    void fill( new_addr_type addr, unsigned time );
-    void fill( unsigned idx, unsigned time );
-
-    unsigned size() const { return m_config.get_num_lines();}
-    cache_block_t &get_block(unsigned idx) { return m_lines[idx];}
-
-    void flush(); // flash invalidate all entries
-    void new_window();
-
-    void print( FILE *stream, unsigned &total_access, unsigned &total_misses ) const;
-    float windowed_miss_rate( ) const;
-    void get_stats(unsigned &total_access, unsigned &total_misses, unsigned &total_hit_res, unsigned &total_res_fail) const;
-
-	void update_cache_parameters(cache_config &config);
-protected:
-    // This constructor is intended for use only from derived classes that wish to
-    // avoid unnecessary memory allocation that takes place in the
-    // other tag_array constructor
-    tag_array( cache_config &config,
-               int core_id,
-               int type_id,
-               cache_block_t* new_lines );
-    void init( int core_id, int type_id );
-
-protected:
-
-    cache_config &m_config;
-
-    cache_block_t *m_lines; /* nbanks x nset x assoc lines in total */
-
-    unsigned m_access;
-    unsigned m_miss;
-    unsigned m_pending_hit; // number of cache miss that hit a line that is allocated but not filled
-    unsigned m_res_fail;
-
-    // performance counters for calculating the amount of misses within a time window
-    unsigned m_prev_snapshot_access;
-    unsigned m_prev_snapshot_miss;
-    unsigned m_prev_snapshot_pending_hit;
-
-    int m_core_id; // which shader core is using this
-    int m_type_id; // what kind of cache is this (normal, texture, constant)
-};
+// lld: variables and functions for replacement
+#include "repl_policy.h"
 
 class mshr_table {
 public:
@@ -397,22 +448,30 @@ public:
     ,m_data(2*num_entries)
 #endif
     {
+        m_line_sz = 0;
+        m_size_full = 0;
+        m_list_full = 0;
     }
 
     /// Checks if there is a pending request to the lower memory level already
-    bool probe( new_addr_type block_addr ) const;
+    bool probe( new_addr_type block_addr, mem_fetch *mf ) const; // lld: sector cache
+    // lld: check if this request has been returned
+    bool is_ready( new_addr_type block_addr, mem_fetch *mf ) const;
     /// Checks if there is space for tracking a new memory access
-    bool full( new_addr_type block_addr ) const;
+    bool full( new_addr_type block_addr );
     /// Add or merge this access
-    void add( new_addr_type block_addr, mem_fetch *mf );
+    void add( new_addr_type block_addr, mem_fetch *mf, std::bitset<MAX_CACHE_CHUNK_NUM> ready_sector_mask ); // lld: sector cache
     /// Returns true if cannot accept new fill responses
     bool busy() const {return false;}
     /// Accept a new cache fill response: mark entry ready for processing
-    void mark_ready( new_addr_type block_addr, bool &has_atomic );
+    void mark_ready( mem_fetch *mf, new_addr_type block_addr, bool &has_atomic ); // lld: sector cache
     /// Returns true if ready accesses exist
-    bool access_ready() const {return !m_current_response.empty();}
+    //bool access_ready() const {return !m_current_response.empty();}
+    bool access_ready() const {if(m_type == SECTOR_MSHR || m_type == LARGE_MSHR) return !m_current_ready_request.empty();
+                               else return !m_current_response.empty();} // lld: sector cache
     /// Returns next ready access
     mem_fetch *next_access();
+    mem_fetch *sector_next_access(); // lld: sector cache
     void display( FILE *fp ) const;
 
     void check_mshr_parameters( unsigned num_entries, unsigned max_merged )
@@ -420,6 +479,21 @@ public:
     	assert(m_num_entries==num_entries && "Change of MSHR parameters between kernels is not allowed");
     	assert(m_max_merged==max_merged && "Change of MSHR parameters between kernels is not allowed");
     }
+
+    // lld: adaptive granularity
+    void set_type(enum mshr_config_t type) { m_type = type; }
+    void set_line_sz(unsigned line_sz) { m_line_sz = line_sz; }
+    void set_cache_line_sz(unsigned line_sz) { m_cache_line_sz = line_sz; }
+    new_addr_type get_block_addr( new_addr_type addr ) const
+    {
+        return addr & ~(m_line_sz-1);
+    }
+    new_addr_type get_cache_block_addr( new_addr_type addr ) const
+    {
+        return addr & ~(m_cache_line_sz-1);
+    }
+    void set_l2(bool l2) { m_l2=l2; }
+    void get_sub_stats(struct cache_sub_stats &css) const;
 
 private:
 
@@ -430,6 +504,9 @@ private:
     struct mshr_entry {
         std::list<mem_fetch*> m_list;
         bool m_has_atomic; 
+        std::bitset<MAX_CACHE_CHUNK_NUM> m_sector_mask; // lld: sector cache
+        std::bitset<MAX_CACHE_CHUNK_NUM> m_ready_sector_mask; // lld: sector cache
+        std::bitset<MAX_CACHE_CHUNK_NUM> m_original_ready_sector_mask; // lld: sector cache
         mshr_entry() : m_has_atomic(false) { }
     }; 
     typedef tr1_hash_map<new_addr_type,mshr_entry> table;
@@ -438,6 +515,16 @@ private:
     // it may take several cycles to process the merged requests
     bool m_current_response_ready;
     std::list<new_addr_type> m_current_response;
+    std::list<mem_fetch*> m_current_ready_request; // lld: sector cache
+    std::list<mem_fetch*> m_other_ready_request; // lld: sector cache
+    // lld: adaptive granularity
+    enum mshr_config_t m_type;
+    unsigned m_line_sz;
+    unsigned m_cache_line_sz;
+    bool m_l2;
+
+    unsigned m_size_full;
+    unsigned m_list_full;
 };
 
 
@@ -450,6 +537,25 @@ struct cache_sub_stats{
     unsigned misses;
     unsigned pending_hits;
     unsigned res_fails;
+
+    // lld
+    unsigned partial_misses;
+    unsigned fills;
+    unsigned long long total_lat;
+    unsigned hit_fills;
+    unsigned long long total_hit_lat;
+    unsigned mshr_size_full;
+    unsigned mshr_list_full;
+    unsigned prefetches;
+    unsigned useful_prefetches;
+    unsigned useless_prefetches;
+    unsigned desired_prefetches;
+    unsigned miss_repl;
+    unsigned partial_miss_repl;
+    unsigned reuse[MAX_MEMORY_ACCESS_SIZE+1];
+    unsigned chunk_reuse[MAX_CACHE_CHUNK_NUM+1];
+    unsigned chunk_cont_reuse[MAX_CACHE_CHUNK_NUM+1];
+    unsigned repl_stats[NUM_CACHE_REPL_STATS];
 
     unsigned long long port_available_cycles; 
     unsigned long long data_port_busy_cycles; 
@@ -466,6 +572,28 @@ struct cache_sub_stats{
         port_available_cycles = 0; 
         data_port_busy_cycles = 0; 
         fill_port_busy_cycles = 0; 
+        // lld
+        partial_misses = 0;
+        fills = 0;
+        total_lat = 0;
+        hit_fills = 0;
+        total_hit_lat = 0;
+        mshr_size_full = 0;
+        mshr_list_full = 0;
+        prefetches = 0;
+        useful_prefetches = 0;
+        useless_prefetches = 0;
+        desired_prefetches = 0;
+        miss_repl = 0;
+        partial_miss_repl = 0;
+        for(unsigned i = 0; i <= MAX_MEMORY_ACCESS_SIZE; i++)
+            reuse[i] = 0;
+        for(unsigned i = 0; i <= MAX_CACHE_CHUNK_NUM; i++) {
+            chunk_reuse[i] = 0;
+            chunk_cont_reuse[i] = 0;
+        }
+        for(int i = 0; i < NUM_CACHE_REPL_STATS; i++)
+            repl_stats[i] = 0;
     }
     cache_sub_stats &operator+=(const cache_sub_stats &css){
         ///
@@ -478,6 +606,28 @@ struct cache_sub_stats{
         port_available_cycles += css.port_available_cycles; 
         data_port_busy_cycles += css.data_port_busy_cycles; 
         fill_port_busy_cycles += css.fill_port_busy_cycles; 
+        // lld
+        partial_misses += css.partial_misses;
+        fills += css.fills;
+        total_lat += css.total_lat;
+        hit_fills += css.hit_fills;
+        total_hit_lat += css.total_hit_lat;
+        mshr_size_full += css.mshr_size_full;
+        mshr_list_full += css.mshr_list_full;
+        prefetches += css.prefetches;
+        useful_prefetches += css.useful_prefetches;
+        useless_prefetches += css.useless_prefetches;
+        desired_prefetches += css.desired_prefetches;
+        miss_repl += css.miss_repl;
+        partial_miss_repl += css.partial_miss_repl;
+        for(unsigned i = 0; i <= MAX_MEMORY_ACCESS_SIZE; i++)
+            reuse[i] += css.reuse[i];
+        for(unsigned i = 0; i <= MAX_CACHE_CHUNK_NUM; i++) {
+            chunk_reuse[i] += css.chunk_reuse[i];
+            chunk_cont_reuse[i] += css.chunk_cont_reuse[i];
+        }
+        for(int i = 0; i < NUM_CACHE_REPL_STATS; i++)
+            repl_stats[i] += css.repl_stats[i];
         return *this;
     }
 
@@ -493,6 +643,28 @@ struct cache_sub_stats{
         ret.port_available_cycles = port_available_cycles + cs.port_available_cycles; 
         ret.data_port_busy_cycles = data_port_busy_cycles + cs.data_port_busy_cycles; 
         ret.fill_port_busy_cycles = fill_port_busy_cycles + cs.fill_port_busy_cycles; 
+        // lld
+        ret.partial_misses = partial_misses + cs.partial_misses;
+        ret.fills = fills + cs.fills;
+        ret.total_lat = total_lat + cs.total_lat;
+        ret.hit_fills = hit_fills + cs.hit_fills;
+        ret.total_hit_lat = total_hit_lat + cs.total_hit_lat;
+        ret.mshr_size_full = mshr_size_full + cs.mshr_size_full;
+        ret.mshr_list_full = mshr_list_full + cs.mshr_list_full;
+        ret.prefetches = prefetches + cs.prefetches;
+        ret.useful_prefetches = useful_prefetches + cs.useful_prefetches;
+        ret.useless_prefetches = useless_prefetches + cs.useless_prefetches;
+        ret.desired_prefetches = desired_prefetches + cs.desired_prefetches;
+        ret.miss_repl = miss_repl + cs.miss_repl;
+        ret.partial_miss_repl = partial_miss_repl + cs.partial_miss_repl;
+        for(unsigned i = 0; i <= MAX_MEMORY_ACCESS_SIZE; i++)
+            ret.reuse[i] = reuse[i] + cs.reuse[i];
+        for(unsigned i = 0; i <= MAX_CACHE_CHUNK_NUM; i++) {
+            ret.chunk_reuse[i] = chunk_reuse[i] + cs.chunk_reuse[i];
+            ret.chunk_cont_reuse[i] = chunk_cont_reuse[i] + cs.chunk_cont_reuse[i];
+        }
+        for(int i = 0; i < NUM_CACHE_REPL_STATS; i++)
+            ret.repl_stats[i] = repl_stats[i] + cs.repl_stats[i];
         return ret;
     }
 
@@ -535,6 +707,7 @@ class cache_t {
 public:
     virtual ~cache_t() {}
     virtual enum cache_request_status access( new_addr_type addr, mem_fetch *mf, unsigned time, std::list<cache_event> &events ) =  0;
+    virtual void spare_cycle( unsigned time ) =  0; // lld: spare cycles
 
     // accessors for cache bandwidth availability 
     virtual bool data_port_free() const = 0; 
@@ -564,9 +737,12 @@ public:
                enum mem_fetch_status status )
     {
         m_name = name;
-        assert(config.m_mshr_type == ASSOC);
+        assert(config.m_mshr_type >= ASSOC); // lld
         m_memport=memport;
         m_miss_queue_status = status;
+        m_mshrs.set_type(config.m_mshr_type);
+        m_mshrs.set_line_sz(config.get_coalesce_line_sz());
+        m_mshrs.set_cache_line_sz(config.get_line_sz());
     }
 
     virtual ~baseline_cache()
@@ -582,6 +758,7 @@ public:
 	}
 
     virtual enum cache_request_status access( new_addr_type addr, mem_fetch *mf, unsigned time, std::list<cache_event> &events ) =  0;
+    virtual void spare_cycle( unsigned time ) =  0; // lld: spare cycles
     /// Sends next request to lower level of memory
     void cycle();
     /// Interface for response from lower memory level (model bandwidth restictions in caller)
@@ -595,6 +772,7 @@ public:
     // flash invalidate all entries in cache
     void flush(){m_tag_array->flush();}
     void print(FILE *fp, unsigned &accesses, unsigned &misses) const;
+    void print_stats() const; // lld: print replacement stats
     void display_state( FILE *fp ) const;
 
     // Stat collection
@@ -606,6 +784,8 @@ public:
     }
     void get_sub_stats(struct cache_sub_stats &css) const {
         m_stats.get_sub_stats(css);
+        m_mshrs.get_sub_stats(css);
+        m_tag_array->get_sub_stats(css); // lld: get replacement stats
     }
 
     // accessors for cache bandwidth availability 
@@ -657,6 +837,9 @@ protected:
 
     extra_mf_fields_lookup m_extra_mf_fields;
 
+    std::list<mem_fetch*> m_extra_accessq; // lld: extra access queue
+    std::list<mem_fetch*> m_extra_pending_list; // lld: list to record pending extra requests
+
     cache_stats m_stats;
 
     /// Checks whether this request can be handled on this cycle. num_miss equals max # of misses to be handled on this cycle
@@ -669,6 +852,7 @@ protected:
     /// Read miss handler. Check MSHR hit or MSHR available
     void send_read_request(new_addr_type addr, new_addr_type block_addr, unsigned cache_index, mem_fetch *mf,
     		unsigned time, bool &do_miss, bool &wb, cache_block_t &evicted, std::list<cache_event> &events, bool read_only, bool wa);
+    void issue_request(new_addr_type block_addr, unsigned cache_index, mem_fetch *mf, unsigned time, std::list<cache_event> &events, bool wa); // lld: try to combine requests
 
     /// Sub-class containing all metadata for port bandwidth management 
     class bandwidth_management 
@@ -697,6 +881,7 @@ protected:
     }; 
 
     bandwidth_management m_bandwidth_management; 
+    bool m_l2; // lld: whether this is l2 cache
 };
 
 /// Read only cache
@@ -707,6 +892,7 @@ public:
 
     /// Access cache for read_only_cache: returns RESERVATION_FAIL if request could not be accepted (for any reason)
     virtual enum cache_request_status access( new_addr_type addr, mem_fetch *mf, unsigned time, std::list<cache_event> &events );
+    void spare_cycle( unsigned time ) {} // lld: spare cycles
 
     virtual ~read_only_cache(){}
 
@@ -772,6 +958,7 @@ public:
                                               mem_fetch *mf,
                                               unsigned time,
                                               std::list<cache_event> &events );
+    virtual void spare_cycle( unsigned time ); // lld: spare cycles
 protected:
     data_cache( const char *name,
                 cache_config &config,
@@ -917,6 +1104,8 @@ protected:
                       std::list<cache_event> &events,
                       enum cache_request_status status );
 
+    void prefetch( mem_fetch *mf, unsigned time, enum cache_request_status probe_status ); // lld: generate prefetch requests
+
 };
 
 /// This is meant to model the first level data cache in Fermi.
@@ -928,7 +1117,7 @@ public:
     l1_cache(const char *name, cache_config &config,
             int core_id, int type_id, mem_fetch_interface *memport,
             mem_fetch_allocator *mfcreator, enum mem_fetch_status status )
-            : data_cache(name,config,core_id,type_id,memport,mfcreator,status, L1_WR_ALLOC_R, L1_WRBK_ACC){}
+            : data_cache(name,config,core_id,type_id,memport,mfcreator,status, L1_WR_ALLOC_R, L1_WRBK_ACC){ m_l2=false; m_mshrs.set_l2(m_l2); }
 
     virtual ~l1_cache(){}
 
@@ -937,6 +1126,7 @@ public:
                 mem_fetch *mf,
                 unsigned time,
                 std::list<cache_event> &events );
+    virtual void spare_cycle( unsigned time ); // lld: spare cycles
 
 protected:
     l1_cache( const char *name,
@@ -949,7 +1139,7 @@ protected:
               tag_array* new_tag_array )
     : data_cache( name,
                   config,
-                  core_id,type_id,memport,mfcreator,status, new_tag_array, L1_WR_ALLOC_R, L1_WRBK_ACC ){}
+                  core_id,type_id,memport,mfcreator,status, new_tag_array, L1_WR_ALLOC_R, L1_WRBK_ACC ){ m_l2=false; m_mshrs.set_l2(m_l2); }
 
 };
 
@@ -960,7 +1150,7 @@ public:
     l2_cache(const char *name,  cache_config &config,
             int core_id, int type_id, mem_fetch_interface *memport,
             mem_fetch_allocator *mfcreator, enum mem_fetch_status status )
-            : data_cache(name,config,core_id,type_id,memport,mfcreator,status, L2_WR_ALLOC_R, L2_WRBK_ACC){}
+            : data_cache(name,config,core_id,type_id,memport,mfcreator,status, L2_WR_ALLOC_R, L2_WRBK_ACC){ m_l2=true; m_mshrs.set_l2(m_l2); }
 
     virtual ~l2_cache() {}
 
@@ -969,6 +1159,7 @@ public:
                 mem_fetch *mf,
                 unsigned time,
                 std::list<cache_event> &events );
+    virtual void spare_cycle( unsigned time ); // lld: spare cycles
 };
 
 /*****************************************************************************/
@@ -1006,6 +1197,7 @@ public:
     /// since unlike a normal CPU cache, a "HIT" in texture cache does not
     /// mean the data is ready (still need to get through fragment fifo)
     enum cache_request_status access( new_addr_type addr, mem_fetch *mf, unsigned time, std::list<cache_event> &events );
+    void spare_cycle( unsigned time ) {} // lld: spare cycles
     void cycle();
     /// Place returning cache block into reorder buffer
     void fill( mem_fetch *mf, unsigned time );
@@ -1159,5 +1351,7 @@ private:
 
     extra_mf_fields_lookup m_extra_mf_fields;
 };
+
+const char * cache_repl_stats_str(enum cache_repl_stats id); // lld
 
 #endif

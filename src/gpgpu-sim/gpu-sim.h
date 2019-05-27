@@ -376,6 +376,7 @@ public:
    void init();
    void cycle();
    bool active(); 
+   bool arrive_limit(); //lld
    void print_stats();
    void update_stats();
    void deadlock_check();
