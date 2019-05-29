@@ -1,12 +1,120 @@
-// Baseline Replacement Policy Types
-#define BASE_REPL_LRU
-//#define BASE_REPL_NRU
-//#define BASE_REPL_SRRIP
-//#define BASE_REPL_PDP
-//#define BASE_REPL_RANDOM
-//#define BASE_REPL_BYPASS
+//#define REPL_DEBUG
 
-#define THREAD_NUM 1
+enum cache_repl_type {
+    BASE_REPL_LRU = 0,
+    BASE_REPL_NRU,
+    BASE_REPL_SRRIP,
+    BASE_REPL_RANDOM,
+    BASE_REPL_PDP
+};
+
+struct BM_entry {
+    bool valid;
+    bool last_itag;
+    unsigned Itid;
+    unsigned Itype;
+    new_addr_type Ipc;
+    int Isign;
+    new_addr_type Itag;
+    new_addr_type Vtag;
+    std::bitset<MAX_CACHE_CHUNK_NUM> i_sector_mask;
+    std::bitset<MAX_CACHE_CHUNK_NUM> v_sector_mask;
+    unsigned  LRUstackposition;
+};
+
+class BypassMonitor
+{
+  private:
+    // parameters
+    unsigned numsets;
+    unsigned assoc;
+    unsigned m_update_pr;
+    unsigned m_bd_addr_len;
+    unsigned m_bd_max_addr;
+    unsigned m_bd_nbit;
+    char m_bd_idx;
+    unsigned m_bm_partial_tag_nbit;
+    cache_config m_cache_config;
+
+    BM_entry **entries;
+    int** BypassDecider;
+
+    // structure parameters
+    unsigned linesize;
+    unsigned lineShift;
+    unsigned indexShift;
+    unsigned indexMask;
+
+    //status
+    unsigned* access_num;
+    unsigned* hititag_num;
+    unsigned* hitvtag_num;
+    unsigned* evict_num;
+    unsigned* evicted_num;
+    unsigned* vichititag_num;
+    unsigned* BD_saturate_counter;
+
+    void UpdateLRU( unsigned setIndex, int updateWayID );
+    void UpdateBD(unsigned tid, new_addr_type PC, new_addr_type addr, new_addr_type vaddr, int sign, bool direction, unsigned weight, unsigned accessType);
+    new_addr_type GetBDaddr(unsigned &tid, new_addr_type PC, new_addr_type addr, new_addr_type vaddr, int sign, unsigned accessType);
+
+    new_addr_type GetTag( new_addr_type addr );
+    new_addr_type GetAddr(unsigned setIndex, new_addr_type tag)
+    {
+        if(m_cache_config.m_set_index_function == FERMI_HASH_SET_FUNCTION)
+            return (tag << lineShift);
+        else
+            return (((tag << indexShift) + setIndex) << lineShift);
+    }
+    int SaturateAdd(int x, int inc, int max);
+    int SaturateSub(int x, int inc, int max);
+
+  public:
+    cache_repl_type m_base_repl;
+    bool m_prefetch_aware;
+    unsigned m_rrpv_nbit;
+    unsigned NumThreadsPerCache;  // number threads per cache
+    unsigned misses;
+
+    BypassMonitor(cache_config cfg);
+    int  Get_Victim( unsigned tid, unsigned setIndex );
+    void Fill(int set, int way, mem_fetch *mf, unsigned tid, address_type pc, new_addr_type addr, cache_block_t *vic_blk, int sign, std::bitset<MAX_CACHE_CHUNK_NUM> sector_mask, mem_access_type type, bool l2);
+    int  LookUp(mem_fetch *mf, unsigned tid, new_addr_type addr, bool l2);
+    void LookUpVictim(unsigned tid, cache_block_t *vic_blk);
+    bool IsBypass(unsigned tid, new_addr_type PC, new_addr_type addr, new_addr_type vaddr, int sign, unsigned accessType);
+    unsigned GetSetIndex( new_addr_type addr )
+    {
+        assert(numsets <= m_cache_config.m_nset);
+
+        if(m_cache_config.m_set_index_function == FERMI_HASH_SET_FUNCTION) {
+            unsigned lower_xor = 0;
+            unsigned upper_xor = 0;
+            lower_xor = (addr >> lineShift) & 0x1F;
+            // Upper xor value is bits 13, 14, 15, 17, and 19
+            //upper_xor  = (addr & 0xE000)  >> 13; // Bits 13, 14, 15
+            //upper_xor |= (addr & 0x20000) >> 14; // Bit 17
+            //upper_xor |= (addr & 0x80000) >> 15; // Bit 19
+            // lld: for other line size
+            upper_xor  = (addr >> (lineShift + 6)) & 0x7; // Bits 13, 14, 15
+            upper_xor |= (addr >> (lineShift + 7)) & 0x8; // Bit 17
+            upper_xor |= (addr >> (lineShift + 8)) & 0x10; // Bit 19
+
+            unsigned set_index = (lower_xor ^ upper_xor);
+
+            // 48KB cache prepends the set_index with bit 12
+            if(m_cache_config.m_nset == 64)
+                //set_index |= (addr & 0x1000) >> 7;
+                set_index |= (addr >> lineShift) & 0x20; // lld: for other line size
+
+            return (set_index & indexMask);
+            //return (m_cache_config.set_index(addr) & indexMask);
+        } else
+            return ((addr >> lineShift) & indexMask);
+    }
+
+    void Print(std::ostream &out);
+    void PrintStats(std::ostream &out);
+};
 
 // Replacement State Per Cache Line
 typedef struct
@@ -26,6 +134,7 @@ CRS_TUP_BEGIN( cache_repl_stats ) \
    CRS_TUP( INTER_HIT ), \
    CRS_TUP( BYPASS ), \
    CRS_TUP( NONBYPASS ), \
+   CRS_TUP( EXTRAREPL ), \
    CRS_TUP( NUM_CACHE_REPL_STATS ) \
 CRS_TUP_END( mem_access_type ) 
 
@@ -50,10 +159,17 @@ public:
     unsigned fill( mem_fetch *mf, new_addr_type addr, unsigned time );
     unsigned fill( mem_fetch *mf, new_addr_type addr, unsigned idx, unsigned time );
 
-    enum cache_request_status probe_selector( mem_fetch *mf, new_addr_type addr, unsigned &idx, std::list<unsigned> &repl_idx, unsigned time );
-    enum cache_request_status access_probe( mem_fetch *mf, new_addr_type addr, unsigned &idx, std::list<unsigned> &repl_idx, unsigned time );
+    enum cache_request_status probe_selector( mem_fetch *mf, new_addr_type addr, unsigned &idx, std::list<unsigned> &repl_set, unsigned time );
+    enum cache_request_status access_probe( mem_fetch *mf, new_addr_type addr, unsigned &idx, std::list<unsigned> &repl_set, unsigned time );
+    enum cache_request_status fill_probe( mem_fetch *mf, new_addr_type addr, unsigned &idx );
     unsigned get_victim(mem_fetch *mf, new_addr_type addr);
-    void update(mem_fetch *mf, new_addr_type addr, unsigned idx, bool hit);
+    unsigned get_partial_victim(mem_fetch *mf, new_addr_type addr, unsigned idx); // partial_miss
+    unsigned get_real_victim(mem_fetch *mf, new_addr_type addr, unsigned idx); // cannot bypass
+    void update(mem_fetch *mf, new_addr_type addr, unsigned idx, enum cache_request_status status);
+    void touch(mem_fetch *mf, new_addr_type addr); // touch address
+    void decide_allocation(mem_fetch *mf, new_addr_type addr); // decide which parts should be allocated
+    void decide_prefetch(mem_fetch *mf, new_addr_type addr); // decide which parts should be prefetched
+    bool check_avail(mem_fetch *mf, new_addr_type addr) { return true; } // check reservation fail
 
     unsigned size() const { return m_config.get_num_lines();}
     cache_block_t &get_block(unsigned idx) { return m_lines[idx];}
@@ -81,14 +197,16 @@ protected:
     void init_repl(); // lld: initialize replacement status
     void update_stat(mem_fetch *mf, unsigned idx, bool hit); // lld: update statistics
     void update_sets(unsigned set_index); // lld: update set status
+    unsigned hash_function(int idx, unsigned key); // hash function for LAMAR
 
     // new functions
-    int  Get_Random_Victim( unsigned setIndex );
-    int  Get_LRU_Victim( unsigned setIndex );
+    int  Get_Random_Victim( unsigned setIndex, unsigned used_idx );
+    int  Get_LRU_Victim( unsigned setIndex, unsigned used_idx );
+    int  Get_LRU_Victim_SizeAware( unsigned setIndex, unsigned used_idx, unsigned size );
     void UpdateLRU( unsigned setIndex, int updateWayID );
-    int  Get_NRU_Victim( unsigned setIndex );
+    int  Get_NRU_Victim( unsigned setIndex, unsigned used_idx );
     void UpdateNRU( unsigned setIndex, int updateWayID );
-    int  Get_RRIP_Victim( unsigned setIndex );
+    int  Get_RRIP_Victim( unsigned setIndex, unsigned used_idx );
     void UpdateSRRIP(unsigned setIndex, int updateWayID, bool cacheHit);
 
 protected:
@@ -106,16 +224,18 @@ protected:
 
     // lld
     unsigned m_fill;
-    unsigned m_total_lat;
+    unsigned long long m_total_lat;
     unsigned m_hit_fill;
-    unsigned m_total_hit_lat;
+    unsigned long long m_total_hit_lat;
     unsigned m_intra_warp_hit;
     unsigned m_inter_warp_hit;
     unsigned m_reuse[MAX_MEMORY_ACCESS_SIZE+1];
     unsigned m_chunk_reuse[MAX_CACHE_CHUNK_NUM+1];
     unsigned m_chunk_cont_reuse[MAX_CACHE_CHUNK_NUM+1];
+    unsigned m_issued_prefetch;
     unsigned m_useful_prefetch;
     unsigned m_useless_prefetch;
+    unsigned m_desired_prefetch;
     unsigned m_miss_repl;
     unsigned m_partial_miss_repl;
 
@@ -134,26 +254,28 @@ protected:
 
     unsigned m_bypasses;
     unsigned m_nonbypasses;
+    unsigned m_extra_repl;
     unsigned * reused_num;
     unsigned * hitposition;
+    unsigned m_hit_pos_max;
+
+    BypassMonitor* BM;
 };
 
-// RRIP
-#define RRPV_BITS 2
-#define RRPV_DIS  ((1 << RRPV_BITS) - 1)
-#define RRPV_LONG ((1 << RRPV_BITS) - 2)
-
 #define REUSED_MAX_NUM 16
-#if defined(BASE_REPL_LRU)
-    #define HIT_POS_MAX m_assoc
-#elif defined(BASE_REPL_NRU)
-    #define HIT_POS_MAX 2
-#elif defined(BASE_REPL_SRRIP)
-    #define HIT_POS_MAX (RRPV_DIS + 1)
-#elif defined(BASE_REPL_PDP)
-    #define HIT_POS_MAX 1
-#elif defined(BASE_REPL_RANDOM)
-    #define HIT_POS_MAX 1
-#else
-    #define HIT_POS_MAX 1
-#endif
+
+// Bypass Decider Parameters
+#define BD_ADDR_MASK ((1 << m_bd_addr_len) - 1)
+#define BD_PC_SHIFT 3
+#define BD_ADDR_SHIFT 10  // Sub 2 for multi-thread workloads
+
+#define BD_BIT m_bd_nbit
+#define BD_MAX ((1 << (BD_BIT - 1)) - 1)
+
+#define BM_PARTIAL_TAG_BIT m_bm_partial_tag_nbit
+#define BM_PARTIAL_TAG_MASK ((1 << BM_PARTIAL_TAG_BIT) - 1)
+
+// RRIP
+#define RRPV_BITS (BM->m_rrpv_nbit)
+#define RRPV_DIS  (unsigned)((1 << RRPV_BITS) - 1)
+#define RRPV_LONG (unsigned)((1 << RRPV_BITS) - 2)
